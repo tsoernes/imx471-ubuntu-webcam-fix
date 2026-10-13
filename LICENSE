@@ -1,0 +1,9 @@
+This repository contains components under two licenses:
+
+* sensor-module/imx471.c: GPL-2.0, as identified by its preserved upstream
+  SPDX header. See LICENSES/GPL-2.0.txt.
+* All other original code, configuration, and documentation: MIT.
+  See LICENSES/MIT.txt.
+
+The MIT-licensed userspace helper is a separate program, not linked into
+the GPL-licensed kernel module.

@@ -1,0 +1,22 @@
+[Unit]
+Description=Normalize IMX471 loopback frame-rate fractions for PipeWire
+BindsTo=v4l2-relayd@builtin.service
+PartOf=v4l2-relayd@builtin.service
+After=v4l2-relayd@builtin.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/imx471-normalize-framerate --watch /dev/video50
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+DevicePolicy=closed
+DeviceAllow=/dev/video50 rw
+MemoryMax=16M
+MemorySwapMax=0
+TasksMax=1
