@@ -16,7 +16,7 @@ jobs:
           mkdir build
           cc -std=gnu11 -O2 -Wall -Wextra -Werror -fanalyzer normalize-framerate.c -o build/normalize-framerate
       - name: Check installer syntax
-        run: fish -n install.fish build-relay.fish install-idle-fix.fish tests/run-relay-tests.fish
+        run: fish -c 'for source in *.fish tests/*.fish; fish -n $source; or exit 1; end'
       - name: Build patched relay and test idle lifecycle (no camera)
         run: fish ./build-relay.fish && fish tests/run-relay-tests.fish
       - name: Test isolated source lifecycle (no camera)
