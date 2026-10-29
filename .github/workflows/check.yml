@@ -5,16 +5,24 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # fdsrc:is-live requires GStreamer >=1.26; match the supported host distro.
+    container: ubuntu:26.04
     steps:
+      - name: Install build and test dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config git ca-certificates nodejs fish libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-tools
       - uses: actions/checkout@v4
-      - name: Install syntax checker
-        run: sudo apt-get update && sudo apt-get install -y fish
       - name: Compile and statically analyze helper
         run: |
           mkdir build
           cc -std=gnu11 -O2 -Wall -Wextra -Werror -fanalyzer normalize-framerate.c -o build/normalize-framerate
       - name: Check installer syntax
-        run: fish -n install.fish
+        run: fish -n install.fish build-relay.fish install-idle-fix.fish tests/run-relay-tests.fish
+      - name: Build patched relay and test idle lifecycle (no camera)
+        run: fish ./build-relay.fish && fish tests/run-relay-tests.fish
+      - name: Test isolated source lifecycle (no camera)
+        run: env RELAY_TEST_ISOLATE=1 fish tests/run-relay-tests.fish
+      - name: Check optional browser test syntax
+        run: node --check tests/edge-capture.cjs
       - name: Check helper usage rejection (no camera access)
         run: |
           rc=0

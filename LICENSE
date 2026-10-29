@@ -1,6 +1,7 @@
 This repository contains components under two licenses:
 
-* sensor-module/imx471.c: GPL-2.0, as identified by its preserved upstream
+* sensor-module/imx471.c, relay/v4l2-relayd.c and tests/relay-lifecycle.c:
+  GPL-2.0, as identified by their preserved upstream
   SPDX header. See LICENSES/GPL-2.0.txt.
 * All other original code, configuration, and documentation: MIT.
   See LICENSES/MIT.txt.

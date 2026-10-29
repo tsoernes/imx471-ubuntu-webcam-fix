@@ -1,0 +1,286 @@
+diff --git a/src/v4l2-relayd.c b/src/v4l2-relayd.c
+index 6e7d6de..17ce687 100644
+--- a/src/v4l2-relayd.c
++++ b/src/v4l2-relayd.c
+@@ -18,7 +18,12 @@
+ #include <errno.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
++#include <sys/wait.h>
++#include <signal.h>
+ #include <linux/videodev2.h>
++#if defined (__GLIBC__)
++#include <malloc.h>
++#endif
+ 
+ #include <glib.h>
+ #include <glib-unix.h>
+@@ -45,6 +50,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_debug_category);
+ static gboolean opt_background = FALSE;
+ static gboolean opt_debug = FALSE;
+ static gboolean opt_version = FALSE;
++static gboolean opt_isolate_input = FALSE;
+ static gchar *opt_input = NULL;
+ static gchar *opt_output = NULL;
+ static gchar *opt_splash =
+@@ -55,9 +61,12 @@ static guint input_bus_watch_id = 0;
+ static guint output_bus_watch_id = 0;
+ static guint splash_bus_watch_id = 0;
+ static guint v4l2_event_poll_id = 0;
++static guint idle_release_id = 0;
+ static GstElement *input_pipeline = NULL;
+ static GstElement *output_pipeline = NULL;
+ static GstElement *splash_pipeline = NULL;
++static GPid source_worker_pid = 0;
++static gint source_worker_fd = -1;
+ 
+ static gboolean    backend_pipeline_bus_call (GstBus      *bus,
+                                               GstMessage  *msg,
+@@ -74,6 +83,8 @@ static const GOptionEntry opt_entries[] =
+     &opt_debug, "Print debugging information", NULL },
+   { "version",    'v', G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE,
+     &opt_version, "Show version", NULL },
++  { "isolate-input", 0, G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE,
++    &opt_isolate_input, "Run the raw camera source in an on-demand subprocess", NULL },
+   { "input",      'i', G_OPTION_FLAG_NONE, G_OPTION_ARG_STRING,
+     &opt_input, "Specify input GStreamer pipeline description", NULL},
+   { "output",     'o', G_OPTION_FLAG_NONE, G_OPTION_ARG_FILENAME,
+@@ -110,6 +121,9 @@ parse_args (int   argc,
+ 
+   g_option_context_free (context);
+ 
++  if (g_strcmp0 (g_getenv ("IMX471_ISOLATE_INPUT"), "1") == 0)
++    opt_isolate_input = TRUE;
++
+   if (opt_version) {
+     g_print ("%s (%s)\n", g_get_prgname (), V4L2_RELAYD_VERSION);
+     exit (0);
+@@ -153,8 +167,14 @@ backend_pipeline_bus_call (GstBus     *bus,
+       g_error_free (error);
+ 
+       gst_element_set_state (pipeline, GST_STATE_NULL);
++      if (opt_isolate_input && pipeline == input_pipeline)
++        g_main_loop_quit (loop);
+       break;
+     }
++    case GST_MESSAGE_EOS:
++      if (opt_isolate_input && pipeline == input_pipeline)
++        g_main_loop_quit (loop);
++      break;
+     default:
+       break;
+   }
+@@ -171,10 +191,23 @@ backend_appsink_new_sample (GstAppSink *appsink,
+   GstBuffer *buffer;
+ 
+   sample = gst_app_sink_pull_sample (appsink);
++  if (sample == NULL)
++    return GST_FLOW_EOS;
+   buffer = gst_sample_get_buffer (sample);
+   /* gst_app_src_push_buffer wants to take the ownership of the buffer,
+    * so it must hold an additional reference first. */
+   gst_buffer_ref (buffer);
++  if (opt_isolate_input) {
++    /* A fresh raw parser starts at zero on each reopen. Stamp buffers onto
++     * the persistent output's running clock instead of restarting timestamps.
++     * Making the header writable does not copy the raw image bytes. */
++    GstClock *clock = gst_element_get_clock (output_pipeline);
++    buffer = gst_buffer_make_writable (buffer);
++    GST_BUFFER_PTS (buffer) = gst_clock_get_time (clock) -
++        gst_element_get_base_time (output_pipeline);
++    GST_BUFFER_DTS (buffer) = GST_CLOCK_TIME_NONE;
++    gst_object_unref (clock);
++  }
+   gst_app_src_push_buffer (appsrc, buffer);
+   gst_sample_unref (sample);
+ 
+@@ -231,10 +264,12 @@ backend_pipeline_create (const gchar *name,
+                 "drop", TRUE,
+                 "max-buffers", 4,
+                 "emit-signals", TRUE,
++                "sync", !opt_isolate_input,
+                 NULL);
+   g_signal_connect_object (appsink,
+                            "new-sample", (GCallback) backend_appsink_new_sample,
+                            appsrc, 0);
++  gst_object_unref (appsrc);
+   gst_caps_unref (caps);
+ 
+   gst_bin_add (GST_BIN (pipeline), appsink);
+@@ -257,8 +292,46 @@ static GstElement*
+ input_pipeline_get ()
+ {
+   if (input_pipeline == NULL) {
+-    input_pipeline = backend_pipeline_create ("input-pipeline", opt_input,
+-                                              &input_bus_watch_id);
++    gchar *description = NULL;
++    if (opt_isolate_input) {
++      GstElement *appsrc = gst_bin_get_by_name (GST_BIN (output_pipeline), "appsrc");
++      GstCaps *caps = gst_app_src_get_caps (GST_APP_SRC (appsrc));
++      GstVideoInfo info;
++      gchar *caps_string, *command, *format;
++      gchar **argv = NULL;
++      GError *error = NULL;
++      gboolean started = FALSE;
++      gst_object_unref (appsrc);
++      gst_video_info_init (&info);
++      if (!gst_video_info_from_caps (&info, caps)) {
++        g_printerr ("Isolated source requires fixed raw video caps\n");
++        exit (1);
++      }
++      caps_string = gst_caps_to_string (caps);
++      command = g_strdup_printf ("/usr/bin/gst-launch-1.0 -q %s ! %s ! fdsink fd=1 sync=false", opt_input, caps_string);
++      if (g_shell_parse_argv (command, NULL, &argv, &error))
++        started = g_spawn_async_with_pipes (NULL, argv, NULL,
++            G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &source_worker_pid,
++            NULL, &source_worker_fd, NULL, &error);
++      if (!started) {
++        g_printerr ("Cannot start camera worker: %s\n", error != NULL ? error->message : "invalid source command");
++        g_clear_error (&error);
++        exit (1);
++      }
++      format = g_ascii_strdown (gst_video_format_to_string (GST_VIDEO_INFO_FORMAT (&info)), -1);
++      description = g_strdup_printf (
++          "fdsrc fd=%d is-live=true blocksize=%zu ! rawvideoparse format=%s width=%d height=%d framerate=%d/%d",
++          source_worker_fd, info.size, format, info.width, info.height,
++          info.fps_n, info.fps_d);
++      g_free (format);
++      g_strfreev (argv);
++      g_free (command);
++      g_free (caps_string);
++      gst_caps_unref (caps);
++    }
++    input_pipeline = backend_pipeline_create ("input-pipeline",
++        description != NULL ? description : opt_input, &input_bus_watch_id);
++    g_free (description);
+   }
+   return input_pipeline;
+ }
+@@ -276,17 +349,83 @@ splash_pipeline_get ()
+ static void
+ input_pipeline_enable ()
+ {
++  if (idle_release_id != 0) {
++    g_source_remove (idle_release_id);
++    idle_release_id = 0;
++  }
+   gst_element_set_state (splash_pipeline_get (), GST_STATE_NULL);
+   gst_element_set_state (input_pipeline_get (), GST_STATE_PLAYING);
+ }
+ 
++/* A NULL-state pipeline still owns elements, bus references, plugin state and
++ * allocator caches. Drop the whole input graph after a short idle grace period.
++ * Keep the output graph open so exclusive_caps remains a discoverable camera.
++ * All lifecycle callbacks run on the same GLib main context. */
++static gboolean
++input_pipeline_release (gpointer data G_GNUC_UNUSED)
++{
++  idle_release_id = 0;
++  /* The worker owns libcamera/Mesa and all its per-open caches. Termination
++   * gives a hard lifetime boundary even when those libraries retain memory.
++   * Kill before stopping fdsrc so a blocked read always wakes on pipe EOF. */
++  if (source_worker_pid != 0) {
++    gint status;
++    kill (source_worker_pid, SIGTERM);
++    guint attempt;
++    for (attempt = 0; attempt < 50; ++attempt) {
++      pid_t result = waitpid (source_worker_pid, &status, WNOHANG);
++      if (result == source_worker_pid || (result < 0 && errno == ECHILD))
++        break;
++      g_usleep (10000);
++    }
++    if (attempt == 50) {
++      kill (source_worker_pid, SIGKILL);
++      while (waitpid (source_worker_pid, &status, 0) < 0 && errno == EINTR)
++        ;
++    }
++    g_spawn_close_pid (source_worker_pid);
++    source_worker_pid = 0;
++  }
++  if (input_pipeline != NULL) {
++    gst_element_set_state (input_pipeline, GST_STATE_NULL);
++    if (input_bus_watch_id != 0) {
++      g_source_remove (input_bus_watch_id);
++      input_bus_watch_id = 0;
++    }
++    gst_clear_object (&input_pipeline);
++    if (source_worker_fd >= 0) {
++      close (source_worker_fd);
++      source_worker_fd = -1;
++    }
++#if defined (__GLIBC__)
++    malloc_trim (0);
++    if (g_getenv ("IMX471_MEMORY_DIAGNOSTICS") != NULL) {
++      struct mallinfo2 heap = mallinfo2 ();
++      g_print ("Idle allocator: allocated=%zu free=%zu mmap=%zu\n",
++               heap.uordblks, heap.fordblks, heap.hblkhd);
++    }
++#endif
++    g_print ("Camera idle: released input pipeline and trimmed allocator\n");
++  }
++  return G_SOURCE_REMOVE;
++}
++
+ static void
+ input_pipeline_disable ()
+ {
+-  if (input_pipeline != NULL)
++  if (opt_isolate_input) {
++    /* Release the physical camera and its process immediately on last close.
++     * Only the lightweight, discoverable output graph remains resident. */
++    input_pipeline_release (NULL);
++    gst_element_set_state (splash_pipeline_get (), GST_STATE_PLAYING);
++    return;
++  }
++  if (input_pipeline != NULL) {
+     gst_element_set_state (input_pipeline, GST_STATE_NULL);
+-  if (input_pipeline != NULL)
+-    gst_element_set_state (splash_pipeline, GST_STATE_PLAYING);
++    if (idle_release_id == 0)
++      idle_release_id = g_timeout_add_seconds (2, input_pipeline_release, NULL);
++  }
++  gst_element_set_state (splash_pipeline_get (), GST_STATE_PLAYING);
+ }
+ 
+ static gboolean
+@@ -437,6 +576,8 @@ output_pipeline_create ()
+                 "is-live", TRUE,
+                 "emit-signals", FALSE,
+                 NULL);
++  if (opt_isolate_input)
++    g_object_set (appsrc, "format", GST_FORMAT_TIME, NULL);
+   gst_object_unref (appsrc);
+ 
+   bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
+@@ -463,18 +604,22 @@ main (int   argc,
+   GST_INFO ("Running...");
+   g_main_loop_run (loop);
+ 
+-  g_source_remove (input_bus_watch_id);
+-  g_source_remove (output_bus_watch_id);
+-  g_source_remove (splash_bus_watch_id);
++  if (idle_release_id != 0)
++    g_source_remove (idle_release_id);
++  if (output_bus_watch_id != 0)
++    g_source_remove (output_bus_watch_id);
++  if (splash_bus_watch_id != 0)
++    g_source_remove (splash_bus_watch_id);
+ 
+-  gst_element_set_state (output_pipeline, GST_STATE_NULL);
+-  gst_object_unref (GST_OBJECT (output_pipeline));
++  input_pipeline_release (NULL);
+ 
+-  gst_element_set_state (input_pipeline, GST_STATE_NULL);
+-  gst_object_unref (GST_OBJECT (input_pipeline));
++  if (splash_pipeline != NULL) {
++    gst_element_set_state (splash_pipeline, GST_STATE_NULL);
++    gst_object_unref (GST_OBJECT (splash_pipeline));
++  }
+ 
+-  gst_element_set_state (splash_pipeline, GST_STATE_NULL);
+-  gst_object_unref (GST_OBJECT (splash_pipeline));
++  gst_element_set_state (output_pipeline, GST_STATE_NULL);
++  gst_object_unref (GST_OBJECT (output_pipeline));
+ 
+   g_main_loop_unref (loop);
+ 

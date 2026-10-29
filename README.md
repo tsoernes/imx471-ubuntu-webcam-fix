@@ -180,10 +180,99 @@ The relay stop also stops imx471-framerate-normalizer.service; remove its
 /etc/systemd/system unit and /usr/local/libexec/imx471-normalize-framerate
 when rolling back the normalization workaround.
 
+## Optional idle-memory fix (2026-10-29)
+
+The distro relay stops capture by setting its input graph to `NULL`, but keeps
+the graph and bus-watch reference alive. Long-lived library/allocator state can
+therefore remain resident even when PipeWire reports the camera as suspended.
+The local process reached about 258 MiB RSS after repeated use; its cgroup was
+above the 256 MiB soft limit and repeatedly stalled on reclaim.
+
+`relay/v4l2-relayd.c` vendors Ubuntu's 0.2.0 source with a small lifecycle patch:
+
+- In the installed isolated-input mode, run libcamera and Mesa in an on-demand
+  worker process. Stop/reap it and free the parent's input graph on final close.
+  The output pipeline stays alive so the virtual camera remains visible.
+- Transfer fixed-size raw frames over a bounded kernel pipe; there is no image
+  file, socket daemon, or unbounded queue. Rebase frames onto the persistent
+  output clock so reopening does not restart output timestamps.
+- Keeping all input processing in-process was tested first: freeing the graph
+  alone still left per-open library retention. Process isolation ensures those
+  camera-library allocations disappear with the worker, not merely its graph.
+- A non-isolated fallback retains a two-second idle grace period and cancels
+  destruction on quick reopen. The installed service uses immediate isolated
+  cleanup, not that fallback.
+- Return free allocator pages with glibc `malloc_trim(0)`; the instance-specific
+  override limits malloc arenas to two and enables normal allocator trimming.
+- Balance the temporary output-appsrc reference when constructing each input
+  graph. Handle a missing appsink sample during shutdown and nullable cleanup.
+
+The package executable `/usr/bin/v4l2-relayd` is **not replaced**. Only this
+camera instance opts into `/usr/local/libexec/imx471-v4l2-relayd` through an
+additional service override. Existing queue bounds, `sync=false`, frame-rate
+normalization and memory limits remain in place. No periodic service restarts
+or additional resident watchdog are introduced. A source worker exists only
+while a client has the camera open and shares the same service memory limits.
+
+Verified on the stated host: three real Edge 155 captures at about 30 fps,
+followed by twelve native reopens, with no automatic relay restarts. Idle RSS
+stayed about **24 MiB** (formerly ~258 MiB); cgroup memory stayed about
+**26 MiB** across the native tests, with no soft-limit reclaim/OOM events.
+This establishes short-run reopen behavior, not indefinite leak freedom or
+Teams/suspend/resume stability. Detailed measurements are in `PROVENANCE.md`.
+
+### Build, test and explicitly install
+
+Obtain approval before installing any software on a managed workstation.
+Required development packages: `libgstreamer1.0-dev` and
+`libgstreamer-plugins-base1.0-dev`, plus the compiler/pkg-config/Fish toolchain.
+Synthetic tests need the normal GStreamer base plugins; no camera is accessed.
+The installed mode also needs `/usr/bin/gst-launch-1.0` and the base plugins
+`fdsrc`, `fdsink` and `rawvideoparse` (already present on the tested host).
+GStreamer **1.26 or newer** is required for `fdsrc:is-live`; the tested Ubuntu
+26.04 installation uses 1.28.2, and CI uses an Ubuntu 26.04 container.
+
+```fish
+fish ./build-relay.fish
+fish tests/run-relay-tests.fish
+env RELAY_TEST_ISOLATE=1 fish tests/run-relay-tests.fish
+# Close camera clients first. Use a validated GUI askpass helper as above.
+env SUDO_ASKPASS=/usr/sbin/ksshaskpass sudo -A fish ./install-idle-fix.fish
+sudo -k
+```
+
+This separate installer does not install packages or touch the sensor driver.
+It backs up the existing service drop-ins under
+`/var/backups/imx471-idle-<timestamp>/`, installs the reviewed binary and
+overrides, reloads systemd, and restarts **only** the built-in camera relay.
+The original main installer still defaults to the packaged relay; reapply this
+optional override after rebuilding the custom binary as needed.
+
+`tests/edge-capture.cjs` is an optional real-camera regression test using an
+already installed Playwright and real Microsoft Edge in an isolated profile.
+It does not attach to the user's browser, install anything, save images, or
+join Teams. It opens the named built-in camera three times, measures frames
+and luma, closes tracks, waits for idle cleanup, and reports cgroup RAM.
+
+```fish
+# Omit PLAYWRIGHT_MODULE if require('playwright') already resolves normally.
+env PLAYWRIGHT_MODULE=/absolute/path/to/existing/playwright node tests/edge-capture.cjs
+```
+
+For rollback, close clients and remove only
+`/etc/systemd/system/v4l2-relayd@builtin.service.d/60-idle-memory.conf`, then
+reload systemd and restart `v4l2-relayd@builtin.service`. The updated 50-series
+override defaults back to the untouched packaged relay. To restore the exact
+pre-install configuration, restore its backed-up 50-series file as well.
+Remove `/usr/local/libexec/imx471-v4l2-relayd` only after the service no longer
+uses it. Existing frame-rate normalization and bounded buffering are independent
+of this optional change and should be retained.
+
 ## Licensing and provenance
 
-The sensor driver retains its upstream GPL-2.0 SPDX identifier and copyright
-notices; its license text is in `LICENSES/GPL-2.0.txt`. The standalone
+The sensor driver and vendored relay retain their upstream GPL-2.0 license and
+copyright notices; the lifecycle test is GPL-2.0-only. Their license text is in
+`LICENSES/GPL-2.0.txt`. The standalone
 `normalize-framerate.c` helper is MIT-licensed (`LICENSES/MIT.txt`). The
 installer, configuration, and documentation are also MIT-licensed. See
 `PROVENANCE.md` for the source pin, local changes, and validation scope.
